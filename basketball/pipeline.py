@@ -12,10 +12,7 @@ client = InferenceHTTPClient(
     api_key=os.environ["ROBOFLOW_API_KEY"],
 )
 
-# ---- Config ----
-video_path = "lakers-vid-17s.mp4"
-output_path = "output_vid-17s.mp4"
-
+# ---- Static config for this sport/workflow ----
 workspace_name = "sportsapp"
 workflow_id = "find-basketballs-and-basketball-hoops-2"
 
@@ -35,16 +32,18 @@ ABOVE_MAX_H_FRAC = 0.75
 BELOW_MAX_H_FRAC = 1.00
 
 COOLDOWN_SECONDS = 1.0
+
+TEAM_LEFT = "team_left"
+TEAM_RIGHT = "team_right"
 # ----------------
 
-TEAM_LEFT = "team_left"    # you can rename later
-TEAM_RIGHT = "team_right"
 
 def xywh_to_xyxy(p):
     x, y, bw, bh = p["x"], p["y"], p["width"], p["height"]
     x1, y1 = x - bw / 2, y - bh / 2
     x2, y2 = x + bw / 2, y + bh / 2
     return x1, y1, x2, y2
+
 
 def is_ball_above(ball_p, hoop_xyxy):
     bx, by = ball_p["x"], ball_p["y"]
@@ -58,6 +57,7 @@ def is_ball_above(ball_p, hoop_xyxy):
     within = dy <= (ABOVE_MAX_H_FRAC * hoop_h)
     return inside_x and above_top and within
 
+
 def is_ball_below(ball_p, hoop_xyxy):
     bx, by = ball_p["x"], ball_p["y"]
     hx1, hy1, hx2, hy2 = hoop_xyxy
@@ -69,188 +69,216 @@ def is_ball_below(ball_p, hoop_xyxy):
     within = dy <= (BELOW_MAX_H_FRAC * hoop_h)
     return inside_x and below_bottom and within
 
+
 def pick_best(preds, class_names, min_conf):
-    cands = [p for p in preds if p.get("class","") in class_names and p.get("confidence",0.0) >= min_conf]
+    cands = [
+        p
+        for p in preds
+        if p.get("class", "") in class_names and p.get("confidence", 0.0) >= min_conf
+    ]
     return max(cands, key=lambda p: p.get("confidence", 0.0)) if cands else None
 
+
 def get_candidates(preds, class_names, min_conf):
-    return [p for p in preds if p.get("class","") in class_names and p.get("confidence",0.0) >= min_conf]
+    return [
+        p
+        for p in preds
+        if p.get("class", "") in class_names and p.get("confidence", 0.0) >= min_conf
+    ]
 
-cap = cv2.VideoCapture(video_path)
-if not cap.isOpened():
-    raise RuntimeError(f"Could not open video: {video_path}")
 
-src_fps = cap.get(cv2.CAP_PROP_FPS)
-if not src_fps or src_fps != src_fps:
-    src_fps = 30.0
+def run(video_path: str, output_path: str, task: str) -> dict:
+    """
+    Entry point called by main.py.
 
-w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    Currently supports:
+      - task == "count_goals"
+      - task == "track_players" (stub: writes tracked video, no stats yet)
+    """
+    if task not in {"count_goals", "track_players"}:
+        raise ValueError(f"Unsupported basketball task: {task}")
 
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-writer = cv2.VideoWriter(output_path, fourcc, src_fps, (w, h))
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
 
-stride = max(1, int(round(src_fps / process_fps)))
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not src_fps or src_fps != src_fps:
+        src_fps = 30.0
 
-# ---- State ----
-team_scores = {TEAM_LEFT: 0, TEAM_RIGHT: 0}
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-prev_any_above = False
-last_score_frame = -10**9
-cooldown_frames = int(COOLDOWN_SECONDS * src_fps)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, src_fps, (w, h))
 
-last_preds = []
-frame_idx = 0
-processed_idx = 0
+    stride = max(1, int(round(src_fps / process_fps)))
 
-last_hoop_xyxy = None
-ball_side = {}       # tracker_id -> "left"/"right" relative to hoop center
-scored_balls = set() # tracker_ids that have already scored
+    # ---- State ----
+    team_scores = {TEAM_LEFT: 0, TEAM_RIGHT: 0}
 
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        break
+    prev_any_above = False
+    last_score_frame = -10**9
+    cooldown_frames = int(COOLDOWN_SECONDS * src_fps)
 
-    scored_this_frame = False
+    last_preds = []
+    frame_idx = 0
+    processed_idx = 0
 
-    if frame_idx % stride == 0:
-        tmp_path = "tmp_frame.jpg"
-        cv2.imwrite(tmp_path, frame)
+    last_hoop_xyxy = None
+    ball_side = {}       # tracker_id -> "left"/"right" relative to hoop center
+    scored_balls = set() # tracker_ids that have already scored
 
-        result = client.run_workflow(
-            workspace_name=workspace_name,
-            workflow_id=workflow_id,
-            images={"image": tmp_path},
-            use_cache=False,
-        )
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
 
-        wf_outputs = result[0]["predictions"]
-        last_preds = wf_outputs["predictions"]   # ByteTrack output
+        scored_this_frame = False
 
-        processed_idx += 1
+        if frame_idx % stride == 0:
+            tmp_path = "tmp_frame.jpg"
+            cv2.imwrite(tmp_path, frame)
 
-        if save_debug_json and (processed_idx % debug_every_k_processed == 0):
-            with open(f"roboflow_response_frame_{frame_idx}.json", "w") as f:
-                json.dump(result, f, indent=2)
+            result = client.run_workflow(
+                workspace_name=workspace_name,
+                workflow_id=workflow_id,
+                images={"image": tmp_path},
+                use_cache=False,
+            )
 
-        # --- Hoop + all ball candidates ---
-        hoop = pick_best(last_preds, HOOP_CLASS_NAMES, MIN_HOOP_CONF)
-        balls = get_candidates(last_preds, BALL_CLASS_NAMES, MIN_BALL_CONF)
+            wf_outputs = result[0]["predictions"]
+            last_preds = wf_outputs["predictions"]   # ByteTrack output
 
-        if hoop is not None:
-            last_hoop_xyxy = xywh_to_xyxy(hoop)
+            processed_idx += 1
 
-        if last_hoop_xyxy is not None and balls:
-            hx1, hy1, hx2, hy2 = last_hoop_xyxy
-            hoop_cx = (hx1 + hx2) / 2.0
+            if save_debug_json and (processed_idx % debug_every_k_processed == 0):
+                with open(f"roboflow_response_frame_{frame_idx}.json", "w") as f:
+                    json.dump(result, f, indent=2)
 
-            any_above = False
-            any_below = False
-            scoring_ball = None
+            hoop = pick_best(last_preds, HOOP_CLASS_NAMES, MIN_HOOP_CONF)
+            balls = get_candidates(last_preds, BALL_CLASS_NAMES, MIN_BALL_CONF)
 
-            for b in balls:
-                tid = b.get("tracker_id")
-                if tid is None:
-                    continue
+            if hoop is not None:
+                last_hoop_xyxy = xywh_to_xyxy(hoop)
 
-                # 1) remember which side this ball came from
-                if tid not in ball_side:
-                    bx = b["x"]
-                    side = "left" if bx < hoop_cx else "right"
-                    ball_side[tid] = side
+            if last_hoop_xyxy is not None and balls:
+                hx1, hy1, hx2, hy2 = last_hoop_xyxy
+                hoop_cx = (hx1 + hx2) / 2.0
 
-                # 2) check above / below flags
-                if is_ball_above(b, last_hoop_xyxy):
-                    any_above = True
-                if is_ball_below(b, last_hoop_xyxy):
-                    any_below = True
-                    scoring_ball = b   # last ball seen below this frame
+                any_above = False
+                any_below = False
+                scoring_ball = None
 
-            # Count on above -> below, with cooldown and per-ball uniqueness
-            if prev_any_above and any_below and (frame_idx - last_score_frame) > cooldown_frames and scoring_ball is not None:
-                tid = scoring_ball.get("tracker_id")
-                if tid is not None and tid not in scored_balls:
-                    side = ball_side.get(tid)
-                    if side == "left":
-                        team_scores[TEAM_LEFT] += 1
-                    elif side == "right":
-                        team_scores[TEAM_RIGHT] += 1
-                    scored_balls.add(tid)
+                for b in balls:
+                    tid = b.get("tracker_id")
+                    if tid is None:
+                        continue
 
-                    last_score_frame = frame_idx
-                    scored_this_frame = True
+                    # remember side
+                    if tid not in ball_side:
+                        bx = b["x"]
+                        side = "left" if bx < hoop_cx else "right"
+                        ball_side[tid] = side
+
+                    if is_ball_above(b, last_hoop_xyxy):
+                        any_above = True
+                    if is_ball_below(b, last_hoop_xyxy):
+                        any_below = True
+                        scoring_ball = b
+
+                if (
+                    task == "count_goals"
+                    and prev_any_above
+                    and any_below
+                    and (frame_idx - last_score_frame) > cooldown_frames
+                    and scoring_ball is not None
+                ):
+                    tid = scoring_ball.get("tracker_id")
+                    if tid is not None and tid not in scored_balls:
+                        side = ball_side.get(tid)
+                        if side == "left":
+                            team_scores[TEAM_LEFT] += 1
+                        elif side == "right":
+                            team_scores[TEAM_RIGHT] += 1
+                        scored_balls.add(tid)
+
+                        last_score_frame = frame_idx
+                        scored_this_frame = True
+                    prev_any_above = False
+                else:
+                    prev_any_above = any_above or prev_any_above
+            else:
                 prev_any_above = False
+
+        # ---- Drawing ----
+        boxed = frame.copy()
+        for p in last_preds:
+            x, y = p["x"], p["y"]
+            bw, bh = p["width"], p["height"]
+            cls = p.get("class", "obj")
+            conf = p.get("confidence", None)
+            tracker_id = p.get("tracker_id")
+
+            x1, y1 = int(x - bw / 2), int(y - bh / 2)
+            x2, y2 = int(x + bw / 2), int(y + bh / 2)
+
+            cv2.rectangle(boxed, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            if tracker_id is not None:
+                if conf is None:
+                    label = f"{cls} id={tracker_id}"
+                else:
+                    label = f"{cls} {conf:.2f} id={tracker_id}"
             else:
-                prev_any_above = any_above or prev_any_above
+                label = f"{cls}" if conf is None else f"{cls} {conf:.2f}"
+
+            cv2.putText(
+                boxed,
+                label,
+                (x1, max(0, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+        if last_hoop_xyxy is not None:
+            hx1, hy1, hx2, hy2 = last_hoop_xyxy
+            cv2.rectangle(
+                boxed, (int(hx1), int(hy1)), (int(hx2), int(hy2)), (0, 255, 255), 2
+            )
+
+        # overlay score only for count_goals
+        if task == "count_goals":
+            score_text = f"{TEAM_LEFT}: {team_scores[TEAM_LEFT]}  {TEAM_RIGHT}: {team_scores[TEAM_RIGHT]}"
         else:
-            prev_any_above = False
-
-    # ---- Drawing ----
-    boxed = frame.copy()
-    for p in last_preds:
-        x, y = p["x"], p["y"]
-        bw, bh = p["width"], p["height"]
-        cls = p.get("class", "obj")
-        conf = p.get("confidence", None)
-        tracker_id = p.get("tracker_id")
-
-        x1, y1 = int(x - bw / 2), int(y - bh / 2)
-        x2, y2 = int(x + bw / 2), int(y + bh / 2)
-
-        cv2.rectangle(boxed, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        if tracker_id is not None:
-            if conf is None:
-                label = f"{cls} id={tracker_id}"
-            else:
-                label = f"{cls} {conf:.2f} id={tracker_id}"
-        else:
-            label = f"{cls}" if conf is None else f"{cls} {conf:.2f}"
+            score_text = "tracking only"
 
         cv2.putText(
-            boxed, label, (x1, max(0, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA
+            boxed,
+            score_text,
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255) if scored_this_frame else (255, 255, 255),
+            3,
+            cv2.LINE_AA,
         )
 
-    if last_hoop_xyxy is not None:
-        hx1, hy1, hx2, hy2 = last_hoop_xyxy
-        cv2.rectangle(boxed, (int(hx1), int(hy1)), (int(hx2), int(hy2)), (0, 255, 255), 2)
+        writer.write(boxed)
+        frame_idx += 1
 
-    # Team scores overlay
-    cv2.putText(
-        boxed,
-        f"{TEAM_LEFT}: {team_scores[TEAM_LEFT]}  {TEAM_RIGHT}: {team_scores[TEAM_RIGHT]}",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 0, 255) if scored_this_frame else (255, 255, 255),
-        3,
-        cv2.LINE_AA,
-    )
+    cap.release()
+    writer.release()
 
-    writer.write(boxed)
-    frame_idx += 1
-
-cap.release()
-writer.release()
-
-score_path = "latest_score.json"
-with open(score_path, "w") as f:
-    json.dump(
-        {
-            "video_path": video_path,
-            "output_path": output_path,
-            "team_scores": team_scores,
-            "processed_fps": process_fps,
-            "source_fps": src_fps,
-            "processed_frames": processed_idx,
-        },
-        f,
-        indent=2,
-    )
-
-print(f"Wrote {output_path}")
-print(f"Team scores = {team_scores}")
-print(f"Wrote score to {score_path}")
-print(f"Source FPS={src_fps:.2f}, processed FPS~={process_fps}, stride={stride}, processed frames={processed_idx}")
+    summary = {
+        "team_scores": team_scores,
+        "processed_fps": process_fps,
+        "source_fps": src_fps,
+        "processed_frames": processed_idx,
+        "frame_width": w,
+        "frame_height": h,
+    }
+    return summary
