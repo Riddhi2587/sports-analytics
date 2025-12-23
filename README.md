@@ -1,6 +1,6 @@
 # Modular Sports Analytics Pipeline
 
-A generalized computer vision framework for detecting events and tracking objects across different sports. This project uses a unified router to handle specific tasks—like counting goals or tracking players—across Basketball, Soccer, Tennis, and Fitness routines.
+A generalized computer vision framework for detecting events and tracking objects across different sports. This project uses a unified router to handle specific tasks like counting goals or tracking players across Basketball, Soccer, Tennis, and Fitness routines.
 
 ---
 
